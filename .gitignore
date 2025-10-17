@@ -1,0 +1,15 @@
+# Ignore object files
+*.o
+**/*.o
+
+# Common build outputs used in this repository
+bin/
+obj/
+*.img
+*.log
+
+# Editor and OS files
+*.swp
+*~
+.vscode/
+.DS_Store
