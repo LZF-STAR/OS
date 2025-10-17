@@ -4,7 +4,7 @@
 #include <pmm.h>
 
 /* Buddy System常量定义 */
-#define MAX_ORDER 11  // 最大阶数：2^11 = 2048页 = 8MB（可根据实际内存调整）
+#define MAX_ORDER 11  // 最大阶数：2^10 = 1024页 = 4MB（可根据实际内存调整）(2^0 ~ 2^10, 共11个阶)
 
 /* Buddy System空闲区域管理结构 */
 typedef struct {

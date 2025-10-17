@@ -213,24 +213,142 @@ static size_t buddy_nr_free_pages(void) {
  * ============================================================================ */
 
 /* 分配函数：由队友实现 */
+/* ============================================================================
+ * 函数：buddy_alloc_pages
+ * 
+ * 功能：从Buddy System分配n个页面
+ * 
+ * 参数：
+ *   n - 请求的页面数
+ * 
+ * 返回：
+ *   成功：指向分配块首页的指针
+ *   失败：NULL（请求过大或没有能满足要求的空闲块）
+ * 
+ * 算法流程：
+ *   1. 计算需要的阶数 order，使得 2^order >= n
+ *   2. 从 order 开始向上查找第一个非空链表
+ *   3. 如果找到的块阶数大于 order，递归拆分至目标大小
+ *   4. 返回分配的页面指针
+ * 
+ * 示例：
+ *   请求 3 页 -> order=2 (2^2=4页)
+ *   如果 order 2 链表为空，但 order 3 有 8 页块：
+ *     - 拆分 8 页 -> [4页] + [4页]
+ *     - 分配左边 4 页，右边 4 页放回 order 2 链表
+ * 
+ * 学号：2310764
+ * ============================================================================ */
+
 static struct Page *buddy_alloc_pages(size_t n) {
     assert(n > 0);
-    
-    /* TODO: 队友在这里实现分配逻辑
-     * 
-     * 实现步骤提示：
-     * 1. 计算需要的阶数：order = buddy_get_order(n)
-     * 2. 从order开始向上查找第一个非空链表
-     * 3. 如果找到更大的块，需要拆分（split）
-     * 4. 将拆分出的较小块加入低阶链表
-     * 5. 返回分配的页面指针
-     * 
-     * 参考：可以查看default_alloc_pages的结构
-     */
-    
-    cprintf("buddy_alloc_pages: TODO - implement by teammate\n");
-    return NULL;  // 临时返回
+    // 所需要的阶数
+    size_t order = buddy_get_order(n);
+    if(order >= MAX_ORDER){ // 最大阶数只有到 MAX_ORDER - 1
+        cprintf("buddy_alloc_pages: request too large (order %d >= MAX_ORDER %d)\n", 
+            order, MAX_ORDER);
+        return NULL;
+    }
+
+    size_t current_order = order;
+    struct Page *page = NULL;
+
+    // 向上找到第一个大小足够的的order
+    for(; current_order <  MAX_ORDER; current_order++){
+        if(!list_empty(&free_list(current_order))){
+            // 找到符合的，将其移出空闲链表
+            list_entry_t *le = list_next(&free_list(current_order));
+            page = le2page(le, page_link);
+            
+            // 维护空闲链表以及空闲块数量
+            list_del(le);
+            nr_free(current_order)--;
+
+            // 不空闲了
+            ClearPageProperty(page);
+
+            cprintf("  Found block at order %d\n", current_order);
+            break;
+        }
+    }
+    // 没找到可用的块
+    if (page == NULL) {
+        cprintf("buddy_alloc_pages: no available memory\n");
+        return page;
+    }
+
+
+    // 调用split不断拆分直到阶数为order。
+    for(; current_order > order; current_order--){
+        page = split(page);
+    }
+
+
+    // 调试信息
+    cprintf("buddy_alloc_pages: allocated %d pages at %p\n", (1 << order), page);
+    return page;  
 }
+
+/* ============================================================================
+ * 函数：split
+ * 
+ * 功能：将一个块拆分成两个大小相等的伙伴块
+ * 
+ * 参数：
+ *   page - 待拆分块的首页指针（必须是块首页，且page->property > 0）
+ * 
+ * 返回：
+ *   拆分后左半部分的首页指针（用于分配或继续拆分）
+ * 
+ * 实现逻辑：
+ *   1. 计算右半部分的起始位置
+ *   2. 初始化右半部分并加入空闲链表
+ *   3. 更新左半部分的属性
+ *   4 返回左半部分
+ * 
+ * 内存布局示例：
+ *   拆分前 (order=3, 8页)：
+ *   [PPPPPPPP]
+ *    ↑
+ *    page
+ *   
+ *   拆分后 (order=2, 各4页)：
+ *   [PPPP][FFFF]
+ *    ↑    ↑
+ *    返回  free_half (加入链表)
+ * 
+ * 
+ * 注意事项：
+ *   - 拆分前的阶数必须 >= 1 且< MAX_ORDER
+ * 
+ * 学号：2310764
+ * ============================================================================ */
+static struct Page *split(struct  Page *page)
+{
+    // 把当前页拆分成两个页， 其中一个返回，另一个放入空闲页表
+    size_t order = page->property;
+    // order一定是 >= 1  < MAX_ORDER 的。
+    assert(order >= 1 && order < MAX_ORDER);
+    // 位运算貌似比除法快...
+    size_t cur_order = order - 1;
+
+    // 处理空闲的半边，加入空闲链表
+    struct Page *free_half = page +  (1 << cur_order);  
+    free_half->property = cur_order;
+    SetPageProperty(free_half);
+    list_add(&free_list(cur_order), &free_half->page_link);
+    nr_free(cur_order)++;
+
+    // 更新property, 返回被使用的左半边
+    page->property = cur_order;
+    cprintf("  Split: order %d -> two order %d blocks\n", 
+               order , cur_order);
+
+    return page;
+};
+
+
+
 
 /* 释放函数：由队友实现 */
 static void buddy_free_pages(struct Page *base, size_t n) {
