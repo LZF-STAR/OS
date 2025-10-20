@@ -355,7 +355,42 @@ static struct Page *split(struct  Page *page)
 
 
 
-/* 释放函数：由队友实现 2311456*/
+/* 释放函数：由队友实现
+ *
+ * 函数：buddy_free_pages
+ *
+ * 功能：将一段以 base 为起始、长度为 n 页的物理页面回收到 Buddy 系统中，
+ *       并在可能的情况下与相邻的伙伴块进行合并以形成更大的块。
+ *
+ * 参数：
+ *   base - 要释放的页面区段的起始 Page 指针（必须是块的首页或块内任意页的首页，
+ *          但调用者通常应传入实际分配块的起始页）
+ *   n    - 要释放的页面数量（页为单位，>0）
+ *
+ * 实现思路：
+ *   1. 先对 base..base+n-1 的每一页清理标志位（flags）、清零 property 并将引用计数设为 0。
+ *   2. 将这一段根据对齐和剩余大小切分成若干 2 的幂次块（每块大小为 2^order 页），
+ *      对每个块：
+ *       - 将其作为一个 candidate 块，设置 candidate->property = order 并 SetPageProperty(candidate)。
+ *       - 检查该 candidate 的伙伴块（buddy）是否存在且也是空闲且同阶（PageProperty(buddy) && buddy->property == order），
+ *         若满足则从该阶的空闲链表中删除 buddy（list_del），合并两个块（head = min(head, buddy)），
+ *         提升阶数（order++），并继续尝试向上合并直到不能合并或达到 MAX_ORDER。
+ *       - 把合并后的最终块插入对应阶的空闲链表并更新对应阶的 nr_free。
+ *   3. 循环直到处理完 base..base+n-1 的所有页面。
+ *
+ * 注意事项：
+ *   - 要求 n > 0。
+ *   - 释放时应保证参与释放的页面当前未被标记为 PageReserved，且不应该已是空闲块头（PageProperty==0）。
+ *   - 对齐与伙伴计算以 pages 数组起始（page2ppn - nbase）为基准，伙伴索引通过 xor 计算得到。
+ *
+ * 返回值：无。失败条件下通过断言中止（assert）。
+ *
+ * 示例：
+ *   假设 base 对应的索引为 idx，n=4，可以把它视作一个 order=2（4页）块；若其伙伴也是 order=2 并且空闲，
+ *   则两者会合并成 order=3 的块并插入 order=3 的空闲链表。
+ *
+ * 学号：2311456
+ */
 static void buddy_free_pages(struct Page *base, size_t n) {
     assert(n > 0);
     
