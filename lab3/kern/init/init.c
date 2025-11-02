@@ -25,6 +25,9 @@ int kern_init(void) {
 
     print_kerninfo();
 
+        // 触发非法指令异常的测试代码
+    __asm__ volatile(".word 0x00000000");
+
     // grade_backtrace();
     idt_init();  // init interrupt descriptor table
 
