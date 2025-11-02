@@ -25,8 +25,9 @@ int kern_init(void) {
 
     print_kerninfo();
 
-        // 触发非法指令异常的测试代码
-    __asm__ volatile(".word 0x00000000");
+    // 触发非法指令异常的测试代码 , idt_init 之前， 没法处理异常。
+    // __asm__ volatile(".word 0x00000000");
+
 
     // grade_backtrace();
     idt_init();  // init interrupt descriptor table
@@ -34,6 +35,10 @@ int kern_init(void) {
     pmm_init();  // init physical memory management
 
     idt_init();  // init interrupt descriptor table
+
+    
+    // 触发非法指令异常的测试代码
+    __asm__ volatile(".word 0x00000000");
 
     clock_init();   // init clock interrupt
     intr_enable();  // enable irq interrupt
