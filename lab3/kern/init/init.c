@@ -9,6 +9,7 @@
 #include <string.h>
 #include <trap.h>
 #include <dtb.h>
+#include <sbi.h> 
 
 int kern_init(void) __attribute__((noreturn));
 void grade_backtrace(void);
@@ -42,6 +43,13 @@ int kern_init(void) {
 
     clock_init();   // init clock interrupt
     intr_enable();  // enable irq interrupt
+
+    // 在使能中断后测试 ebreak（此时中断系统已完全就绪）
+    // __asm__ volatile("ebreak");
+    
+    // 测试完成，输出提示信息并关机
+    // cprintf("All exception tests passed! Shutting down...\n");
+    // sbi_shutdown();
 
     /* do nothing */
     while (1)
