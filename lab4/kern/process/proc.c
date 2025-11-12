@@ -88,7 +88,7 @@ alloc_proc(void)
     struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
     if (proc != NULL)
     {
-        // LAB4:EXERCISE1 YOUR CODE
+        // LAB4:EXERCISE1 2311456
         /*
          * below fields in proc_struct need to be initialized
          *       enum proc_state state;                      // Process state
@@ -104,6 +104,18 @@ alloc_proc(void)
          *       uint32_t flags;                             // Process flag
          *       char name[PROC_NAME_LEN + 1];               // Process name
          */
+        proc->state = PROC_UNINIT;
+        proc->pid = -1;
+        proc->runs = 0;
+        proc->kstack = 0;
+        proc->need_resched = 0;
+        proc->parent = NULL;
+        proc->mm = NULL;
+        proc->tf = NULL;
+        proc->pgdir = 0;
+        proc->flags = 0;
+        memset(&(proc->context), 0, sizeof(struct context));
+        memset(proc->name, 0, PROC_NAME_LEN);
         
     }
     return proc;
