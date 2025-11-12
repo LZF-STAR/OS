@@ -112,7 +112,35 @@
 
 1) 请说明语句 `local_intr_save(intr_flag); ... local_intr_restore(intr_flag);` 是如何实现开关中断的？
 
-- 在此处简要说明 `local_intr_save` 的实现机制（例如：通过读写 mstatus 或类似寄存器来保存并修改中断使能位），并说明为什么需要保存原来的中断状态以便最后恢复。
+		- 实现要点（参考 `kern/sync/sync.h`）：
+
+			- `local_intr_save(x)` 实际调用 `__intr_save()`：该函数读取 CSR `sstatus`，检查其中的 `SSTATUS_SIE`（Supervisor Interrupt Enable）位。如果该位为 1（表示中断当前允许），`__intr_save()` 会调用 `intr_disable()` 关闭中断并返回 1；若该位为 0，则直接返回 0。`local_intr_save` 将返回值保存到 `intr_flag` 中，从而记录进入临界区前的中断状态。
+
+			- `local_intr_restore(x)` 实际调用 `__intr_restore(x)`：该函数根据传入的 `intr_flag` 值决定是否调用 `intr_enable()` 恢复中断。只有当 `intr_flag` 为 1（进入前中断是开启的）时才重新开启中断；为 0 则保持关闭状态。
+
+		- 为什么要保存并恢复（而不是简单调用 disable/enable）？
+
+			- 保存/恢复机制能正确处理嵌套临界区。举例：若外层函数 A 在进入时保存到 `fa=1` 并关闭中断，内层函数 B 再次调用 `local_intr_save(fb)` 会得到 `fb=0`（因为中断已经被关闭），B 退出时执行 `local_intr_restore(fb)` 将不会开启中断，避免破坏 A 的临界区。只有 A 最外层的 `local_intr_restore(fa)` 会真正恢复中断。示例代码：
+
+				```c
+				void A() {
+						local_intr_save(fa); // 若之前开启 -> 关闭，fa = 1
+						...
+						B();
+						...
+						local_intr_restore(fa); // 若 fa=1 恢复开启
+				}
+
+				void B() {
+						local_intr_save(fb); // 之前已关闭 -> fb = 0
+						...
+						local_intr_restore(fb); // fb=0 不恢复
+				}
+				```
+
+		- 具体实现依赖的原语：`intr_disable()`/`intr_enable()` 通常通过修改 `sstatus` CSR 的中断使能位（例如 SIE/SPIE）来关闭/开启本地中断；`__intr_save()`/`__intr_restore()` 只是对这些原语的薄封装并加入状态保存逻辑。
+
+		- 小结：`local_intr_save/restore` 提供了一种保存-恢复式的本地中断屏蔽机制，能安全地进入临界区并在退出时恢复进入前的中断状态，避免因嵌套保护导致的中断错开问题。这是内核中实现短临界区和保护共享数据结构的常用模式。
 
 2) 分页模式思考题：
 
