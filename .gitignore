@@ -13,3 +13,7 @@ obj/
 *~
 .vscode/
 .DS_Store
+
+# clang 用的index缓存 
+*.idx
+compile_commands.json

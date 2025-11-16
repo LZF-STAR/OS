@@ -9,8 +9,14 @@
 #include <stdio.h>
 #include <trap.h>
 #include <vmm.h>
+// 引入头文件以便使用关机函数
+#include <sbi.h>
 
 #define TICK_NUM 100
+
+// 维护一个全局的时钟中断计数器
+static size_t tick_print_times = 0;
+
 
 static void print_ticks()
 {
