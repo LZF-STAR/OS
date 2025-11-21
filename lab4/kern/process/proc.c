@@ -112,7 +112,7 @@ alloc_proc(void)
         proc->parent = NULL;
         proc->mm = NULL;
         proc->tf = NULL;
-        proc->pgdir = 0;
+        proc->pgdir = boot_pgdir_pa;
         proc->flags = 0;
         memset(&(proc->context), 0, sizeof(struct context));
         memset(proc->name, 0, PROC_NAME_LEN);
@@ -309,7 +309,7 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
         goto fork_out;
     }
     ret = -E_NO_MEM;
-    // LAB4:EXERCISE2 2310764
+    // LAB4:EXERCISE2 YOUR CODE
     /*
      * Some Useful MACROs, Functions and DEFINEs, you can use them in below implementation.
      * MACROs or Functions:
@@ -328,44 +328,12 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
      */
 
     //    1. call alloc_proc to allocate a proc_struct
-    if ((proc = alloc_proc()) == NULL) {
-        goto fork_out;
-    }
-
     //    2. call setup_kstack to allocate a kernel stack for child process
-    if (setup_kstack(proc) != 0) {
-        goto bad_fork_cleanup_proc;
-    }
-
     //    3. call copy_mm to dup OR share mm according clone_flag
-    if (copy_mm(clone_flags, proc) != 0) {
-        goto bad_fork_cleanup_kstack;
-    }
-
     //    4. call copy_thread to setup tf & context in proc_struct
-    copy_thread(proc, stack, tf);
-
-    // 禁用中断，确保原子操作
-    bool intr_flag;
-    local_intr_save(intr_flag);
-    {
-        // 分配PID
-        proc->pid = get_pid();
-        
-        //    5. insert proc_struct into hash_list && proc_list
-        hash_proc(proc);
-        list_add(&proc_list, &(proc->list_link));
-        
-        // 增加进程计数
-        nr_process++;
-    }
-    local_intr_restore(intr_flag);
-
+    //    5. insert proc_struct into hash_list && proc_list
     //    6. call wakeup_proc to make the new child process RUNNABLE
-    wakeup_proc(proc);
-
     //    7. set ret vaule using child proc's pid
-    ret = proc->pid;
     
 fork_out:
     return ret;

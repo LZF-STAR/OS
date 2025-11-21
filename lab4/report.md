@@ -13,13 +13,7 @@
 
 要求：本实验依赖 lab2/lab3，请将你在 lab2、lab3 中的实现合并到 lab4 中 `LAB2`、`LAB3` 注释标注的位置。
 
-你需要在此节中填写：
-
--   合并了哪些文件/函数（列出源文件与主要修改的函数名）
--   合并过程中遇到的问题与解决办法
--   简短说明如何验证合并是否成功（例如：`make qemu` 能正确启动或通过某些测试用例）
-
-占位：在此粘贴/引用你在 lab2、lab3 中重要的代码片段（若太长可给出文件路径与关键函数摘录）。
+关于lab2的内容不需要额外填写，将上次lab3中的时钟中断代码迁移过来即可
 
 ---
 
@@ -29,9 +23,54 @@
 
 请在此处填写你的实现说明：
 
--   设计与实现要点（例如：如何选择内核栈、如何初始化链表节点、初始化字段默认值等）
--   关键代码片段（可粘贴核心初始化代码）
--   测试与验证：如何证明 `alloc_proc` 正确分配并初始化了 PCB（例如：打印字段、使用调试断点、通过运行用例等）
+### alloc_proc 函数实现说明
+
+`alloc_proc` 函数的主要功能是分配并初始化一个新的进程结构体 `proc_struct`。以下是实现的详细说明：
+
+1. **内存分配**：
+   ```c
+   struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
+   ```
+   - 使用 `kmalloc` 分配一块内存，用于存储一个 `proc_struct` 结构体。
+   - 如果分配失败，`kmalloc` 返回 `NULL`，函数直接返回。
+
+2. **字段初始化**：
+   ```c
+   proc->state = PROC_UNINIT;
+   proc->pid = -1;
+   proc->runs = 0;
+   proc->kstack = 0;
+   proc->need_resched = 0;
+   proc->parent = NULL;
+   proc->mm = NULL;
+   proc->tf = NULL;
+   proc->pgdir = boot_pgdir_pa;
+   proc->flags = 0;
+   memset(&(proc->context), 0, sizeof(struct context));
+   memset(proc->name, 0, PROC_NAME_LEN);
+   ```
+   - **`state`**: 设置为 `PROC_UNINIT`，表示进程未初始化。
+   - **`pid`**: 设置为 `-1`，表示进程 ID 尚未分配。
+   - **`runs`**: 初始化为 `0`，表示进程的运行次数为 0。
+   - **`kstack`**: 初始化为 `0`，表示内核栈地址尚未分配。
+   - **`need_resched`**: 初始化为 `0`，表示进程不需要重新调度。
+   - **`parent`**: 设置为 `NULL`，表示没有父进程。
+   - **`mm`**: 设置为 `NULL`，表示进程的内存管理结构尚未分配。
+   - **`tf`**: 设置为 `NULL`，表示进程的中断帧尚未分配。
+   - **`pgdir`**: 设置为 `boot_pgdir_pa`，表示页表基地址。
+   - **`flags`**: 初始化为 `0`，表示进程标志位清零。
+   - **`context`**: 使用 `memset` 将 `context` 结构体清零，确保上下文切换时的初始状态。
+   - **`name`**: 使用 `memset` 将进程名称清零。
+
+3. **返回结果**：
+   ```c
+   return proc;
+   ```
+   - 如果内存分配成功并初始化完成，返回指向 `proc_struct` 的指针。
+   - 如果内存分配失败，返回 `NULL`。
+
+### 总结
+`alloc_proc` 函数是进程管理的基础，确保每个新创建的进程结构体都被正确初始化，为后续的进程调度和运行奠定了基础。
 
 问题回答：
 
