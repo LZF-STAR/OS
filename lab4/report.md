@@ -185,28 +185,106 @@ static int get_pid(void) {
 
 ## 练习 3：proc_run 的实现与说明
 
-任务：实现 `proc_run` 函数，将指定进程切换上 CPU。实现要点列在练习说明中。
+在本实验执行过程中，创建且运行了几个内核线程？
 
-请在此处填写你的实现说明：
+本实验中创建并运行了**2个内核线程**：
 
--   设计要点与实现细节：
+1. **idleproc**（pid = 0）：第0个内核线程，空闲进程
+2. **initproc**（pid = 1）：第1个内核线程，初始化进程
 
-    -   检查目标进程是否等于当前进程（若相同无需切换）
-    -   使用 `local_intr_save(intr_flag)` 禁止中断并保存之前中断状态
-    -   更新 `current` 或类似的当前进程指针
-    -   切换页表（调用 `lsatp` 或 `write_csr(satp, ...)` 等），并执行 `sfence.vma` 如需要
-    -   调用 `switch_to(&old->context, &new->context)` 完成上下文切换
-    -   恢复中断状态 `local_intr_restore(intr_flag)`
+### idleproc的创建和运行过程
 
--   关键代码片段（粘贴核心实现或路径参考）
--   测试与验证：如何运行并观察进程调度行为（例如：运行 `make qemu`，在串口日志或 printk 输出看到多个内核线程被调度）
+**创建过程：**
 
-问题回答：
+1. **分配进程控制块**：在`proc_init()`中调用`alloc_proc()`分配并初始化进程控制块
+2. **初始化关键字段**：
+   - `pid = 0`：分配进程ID为0
+   - `state = PROC_RUNNABLE`：设置为就绪态
+   - `kstack = (uintptr_t)bootstack`：使用启动时的内核栈
+   - `need_resched = 1`：标记需要调度
+   - `name = "idle"`：设置进程名
+3. **设为当前进程**：`current = idleproc`
 
-1. 在本实验执行过程中，创建且运行了几个内核线程？
+**运行过程：**
 
--   请在此列出你实际创建并运行的线程数量与名称（例如：init 线程、若干 worker 线程、idle 线程等），并简要说明其作用与创建位置。
+idleproc是一个特殊的内核线程，它本质上是继承了ucore内核的初始执行流。当`kern_init()`执行完所有初始化后，会调用`cpu_idle()`函数：
 
+```c
+void cpu_idle(void) {
+    while (1) {
+        if (current->need_resched) {
+            schedule();
+        }
+    }
+}
+```
+
+idleproc进入无限循环，不断检查`need_resched`标志。由于在初始化时已将其设为1，因此会立即调用`schedule()`进行进程调度，让出CPU给其他进程（initproc）运行。
+
+### initproc的创建和运行过程
+
+**创建过程：**
+
+1. **调用kernel_thread创建**：
+```c
+int pid = kernel_thread(init_main, "Hello world!!", 0);
+```
+
+2. **构造临时中断帧**：`kernel_thread()`函数构造一个临时的trapframe：
+   - `tf.gpr.s0 = (uintptr_t)fn`：保存函数指针（init_main）
+   - `tf.gpr.s1 = (uintptr_t)arg`：保存函数参数
+   - `tf.epc = (uintptr_t)kernel_thread_entry`：设置入口点
+   - `tf.status`：设置为内核态并允许中断
+
+3. **调用do_fork创建新进程**：
+   - `alloc_proc()`：分配进程控制块
+   - `setup_kstack()`：分配2页大小的内核栈
+   - `copy_mm()`：对于内核线程，mm设为NULL
+   - `copy_thread()`：
+     - 在内核栈顶分配trapframe空间并复制
+     - 设置`a0=0`（子进程返回值）
+     - 设置`context.ra = forkret`（返回地址）
+     - 设置`context.sp`指向trapframe
+   - `get_pid()`：分配pid = 1
+   - `hash_proc()`和`list_add()`：加入进程哈希表和链表
+   - `wakeup_proc()`：设置状态为PROC_RUNNABLE
+
+**运行过程：**
+
+1. **调度选择**：当idleproc调用`schedule()`时，调度器遍历进程链表，找到状态为PROC_RUNNABLE的initproc
+
+2. **进程切换**：调用`proc_run(initproc)`：
+   - 保存中断状态并禁用中断
+   - 更新`current = initproc`
+   - 切换页表：`lsatp(next->pgdir)`
+   - 调用`switch_to(&prev->context, &next->context)`切换上下文
+
+3. **上下文恢复**：`switch_to`恢复initproc的寄存器，包括：
+   - `ra = forkret`：返回地址
+   - `sp`：指向trapframe
+   - 其他被调用者保存寄存器（s0-s11）
+
+4. **执行forkret**：`switch_to`返回后跳转到`forkret`，再调用`forkrets`：
+```assembly
+forkrets:
+    move sp, a0        # sp指向trapframe
+    j __trapret        # 跳转到trapret
+```
+
+5. **恢复中断帧**：`__trapret`从trapframe恢复所有寄存器，包括：
+   - `epc = kernel_thread_entry`
+   - `s0 = init_main`（函数指针）
+   - `s1 = "Hello world!!"`（参数）
+
+6. **执行内核线程入口**：通过`sret`跳转到`kernel_thread_entry`：
+```assembly
+kernel_thread_entry:
+    move a0, s1        # 参数放入a0
+    jalr s0            # 调用init_main
+    jal do_exit        # 执行完毕后退出
+```
+
+7. **执行init_main**：最终执行`init_main()`函数，输出"Hello world!!"信息
 ---
 
 ## 扩展练习（Challenge）
@@ -305,27 +383,62 @@ if (!(*pdep0 & PTE_V)) {
 
 **是否应将页表查找与页表分配拆分为两个函数？**
 
-**支持拆分的理由：**
+### get_pte()设计评价
 
-1. **单一职责原则**：查找和分配是两个不同的操作
-2. **代码复用**：可以单独调用查找功能而不触发分配
-3. **更清晰的接口**：`get_pte()` 和 `alloc_pte()` 语义更明确
-4. **便于调试**：可以分别测试查找和分配逻辑
+`get_pte()`函数将**页表项查找**和**页表分配**两个功能合并在一起，通过`create`参数控制行为：
+- `create = 0`：仅查找，不分配
+- `create = 1`：查找时若页表不存在则分配
 
-**支持合并的理由：**
+### 设计优点
 
-1. **性能考虑**：避免重复遍历页表层次
-2. **原子性**：查找和分配作为一个原子操作，避免并发问题
-3. **使用便利**：大多数情况下需要"查找，如果不存在就分配"的语义
-4. **减少函数调用开销**：特别是在内核中，函数调用有一定开销
+1. **接口简洁统一**：
+   - 只需一个函数即可处理查找和分配两种场景
+   - 调用者通过一个参数即可控制行为
+   - 减少了函数数量，降低了接口复杂度
 
-**结论**：当前的设计是合理的。通过 `create` 参数统一接口既满足了只查找的需求（`create=0`），又提供了查找+分配的功能（`create=1`），是一个很好的权衡。如果一定要拆分，建议保留当前接口作为便利函数，同时提供底层的分离接口供特殊需求使用。
+2. **代码复用性好**：
+   - 查找逻辑只需实现一次
+   - 避免了在查找函数和分配函数中重复相同的遍历代码
+   - 减少了代码维护成本
+
+3. **符合常见使用场景**：
+   - 很多情况下需要"查找，找不到就分配"的语义
+   - 如`page_insert()`必然需要获得或创建页表项
+   - 这种组合操作非常常见
+
+4. **原子性保证**：
+   - 查找和分配在同一个函数中完成
+   - 减少了中间状态，降低了出错可能
+
+
+
+**不拆分的理由：** 拆分会增加函数数量和调用复杂度,Linux等成熟OS也采用类似设计（如`__get_user_pages`）
+
+**改进建议：**
+1. **增加明确的包装函数**：
+```c
+// 仅查找，不分配
+static inline pte_t *find_pte(pde_t *pgdir, uintptr_t la) {
+    return get_pte(pgdir, la, 0);
+}
+
+// 查找或分配
+static inline pte_t *get_or_alloc_pte(pde_t *pgdir, uintptr_t la) {
+    return get_pte(pgdir, la, 1);
+}
+```
+
+2. **改进错误返回机制**：
+```c
+// 返回错误码而不是仅返回NULL
+int get_pte_ex(pde_t *pgdir, uintptr_t la, bool create, pte_t **pte_store);
+```
+
+
 
 ---
 
 ## 知识点映射（实验 ↔ OS 原理）
-
-请列出：
 
 **1) 在本实验中出现的重要知识点与 OS 原理的对应关系：**
 
@@ -380,38 +493,5 @@ if (!(*pdep0 & PTE_V)) {
 
 这些知识点将在后续的 lab5（用户进程）、lab6（调度算法）、lab7（同步机制）、lab8（文件系统）等实验中逐步实现和学习。
 
----
 
-## 验证与运行（如何复现实验）
 
-在仓库根目录下运行：
-
-```bash
-make qemu
-```
-
-或按实验提供的 Makefile 指引编译并在 qemu 中运行。请在此处填写你实际的编译与运行结果，包括串口输出或关键日志摘录。
-
----
-
-## 总结与心得
-
-在此简要总结你完成本次实验的收获、遇到的难点、以及下一步打算。
-
----
-
-## 常见问题与调试提示
-
--   若出现链接或重定位错误，请检查 `kernel.ld` 与段定义是否一致。
--   若新进程无法运行，检查：是否正确设置 `context` 中的返回地址 `ra`、堆栈指针 `sp`、以及 `trapframe` 中的返回值寄存器。
-
----
-
-## 附录：参考代码片段与关键函数位置
-
--   `alloc_proc`：`lab4/kern/process/proc.c`
--   `do_fork`：`lab4/kern/process/proc.c`
--   `proc_run`：`lab4/kern/process/sched.c` 或 `proc.c`（视实现而定）
--   `get_pte`：`lab4/kern/mm/pmm.c`
-
-请按需在附录中粘贴你自己的关键代码实现以备查阅。
