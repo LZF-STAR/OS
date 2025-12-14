@@ -78,6 +78,17 @@
 #define PTE_G 0x020    // Global
 #define PTE_A 0x040    // Accessed
 #define PTE_D 0x080    // Dirty
+
+/* 【COW标志位 - 软件定义】
+ * RISC-V页表项的bit[9:8]保留给软件使用
+ * 我们使用bit 8作为Copy-on-Write标志
+ * 
+ * 当PTE_COW=1时，表示该页面处于COW状态：
+ * - 页面内容被多个进程共享
+ * - 页面被标记为只读（PTE_W=0）
+ * - 写入时会触发Page Fault进行实际复制
+ */
+#define PTE_COW 0x100  // Software: copy-on-write
 #define PTE_SOFT 0x300 // Reserved for Software
 
 #define PAGE_TABLE_DIR (PTE_V)

@@ -220,11 +220,39 @@ void exception_handler(struct trapframe *tf)
     case CAUSE_FETCH_PAGE_FAULT:
         cprintf("Instruction page fault\n");
         break;
+    
+    /* 【COW触发入口 - Load Page Fault】
+     * 当进程读取一个不可访问的页面时触发
+     * 调用do_pgfault尝试处理COW或demand paging
+     */
     case CAUSE_LOAD_PAGE_FAULT:
+        // 尝试COW/需求分页处理；如果无法处理则终止进程
+        if (current != NULL && current->mm != NULL && do_pgfault(current->mm, tf->cause, tf->tval) == 0)
+        {
+            break;  // 成功处理，返回用户态继续执行
+        }
         cprintf("Load page fault\n");
+        print_trapframe(tf);
+        do_exit(-E_KILLED);  // 无法处理，终止进程
         break;
+    
+    /* 【COW触发入口 - Store Page Fault】★主要COW触发路径★
+     * 当进程写入一个只读（COW）页面时触发
+     * 这是COW机制的核心触发点：
+     * 1. fork后，父子进程的可写页面被标记为只读+COW
+     * 2. 当任一进程尝试写入时，触发Store Page Fault
+     * 3. do_pgfault检测到COW标志，执行页面复制
+     * 4. 复制完成后返回用户态，重新执行写指令
+     */
     case CAUSE_STORE_PAGE_FAULT:
+        // 尝试COW处理；如果无法处理则终止进程
+        if (current != NULL && current->mm != NULL && do_pgfault(current->mm, tf->cause, tf->tval) == 0)
+        {
+            break;  // COW处理成功，返回用户态重新执行写指令
+        }
         cprintf("Store/AMO page fault\n");
+        print_trapframe(tf);
+        do_exit(-E_KILLED);  // 无法处理，终止进程
         break;
     default:
         print_trapframe(tf);

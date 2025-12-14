@@ -372,12 +372,66 @@ void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end)
  * didn't be used.
  *
  * CALL GRAPH: copy_mm-->dup_mmap-->copy_range
+ *
+ * [COW Extension]
+ * When ENABLE_COW is defined, use copy-on-write optimization:
+ *   - fork does not copy pages, parent and child share the same physical page
+ *   - Mark shared pages as read-only + PTE_COW
+ *   - When writing, trigger page fault, do_pgfault will do the real copy
+ * When ENABLE_COW is not defined, use traditional full copy
  */
 int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
                bool share)
 {
     assert(start % PGSIZE == 0 && end % PGSIZE == 0);
     assert(USER_ACCESS(start, end));
+
+#ifdef ENABLE_COW
+    /* ========== COW (Copy-on-Write) Implementation ========== */
+    do
+    {
+        // Get parent process page table entry
+        pte_t *ptep = get_pte(from, start, 0);
+        if (ptep == NULL)
+        {
+            // If page table does not exist, skip the entire page table range
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue;
+        }
+        // Only process valid page table entries
+        if (*ptep & PTE_V)
+        {
+            // Create page table entry for child process (create page table if not exist)
+            if (get_pte(to, start, 1) == NULL)
+            {
+                return -E_NO_MEM;
+            }
+            // Get permission bits and physical page
+            uint32_t perm = (*ptep & PTE_USER);
+            struct Page *page = pte2page(*ptep);
+
+            // [COW Core Logic] For writable pages, implement copy-on-write
+            if (perm & PTE_W)
+            {
+                // 1. Set COW flag, clear write permission (become read-only)
+                perm = (perm | PTE_COW) & ~PTE_W;
+                // 2. Also modify parent process page table entry (parent also becomes read-only+COW)
+                *ptep = (*ptep | PTE_COW) & ~PTE_W;
+                // 3. Flush TLB to make parent's modification effective
+                tlb_invalidate(from, start);
+            }
+
+            // Map the same physical page to child process (page_ref will +1)
+            // At this point parent and child share the same physical page
+            page_insert(to, page, start, perm);
+        }
+        start += PGSIZE;
+    } while (start != 0 && start < end);
+
+    return 0;
+
+#else
+    /* ========== Traditional Full Copy Implementation ========== */
     // copy content by page unit.
     do
     {
@@ -431,6 +485,8 @@ int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
         }
         start += PGSIZE;
     } while (start != 0 && start < end);
+#endif /* ENABLE_COW */
+
     return 0;
 }
 
