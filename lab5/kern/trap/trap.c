@@ -137,6 +137,10 @@ void interrupt_handler(struct trapframe *tf)
                 sbi_shutdown();
             }
         }
+        // Set need_resched only when interrupt from user mode
+        if (current && !trap_in_kernel(tf)) {
+            current->need_resched = 1;
+        }
         break;
     case IRQ_H_TIMER:
         cprintf("Hypervisor software interrupt\n");
