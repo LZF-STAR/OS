@@ -554,8 +554,11 @@ int do_exit(int error_code)
     {
         panic("initproc exit.\n");
     }
-    
+
     // ========== 步骤1: 释放内存空间 ==========
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
     struct mm_struct *mm = current->mm;
     if (mm != NULL)
     {
@@ -573,7 +576,6 @@ int do_exit(int error_code)
         current->mm = NULL;
     }
     
-    bool intr_flag;
     struct proc_struct *proc;
     
     // 【关键修复】将设置ZOMBIE状态和唤醒父进程放在同一个临界区内
@@ -582,8 +584,7 @@ int do_exit(int error_code)
     // 2. 父进程do_wait检查时发现不是ZOMBIE（因为还在遍历），然后设置SLEEPING
     // 3. 子进程检查wait_state时父进程还没设置SLEEPING，所以不唤醒
     // 4. 结果：子进程变成ZOMBIE，父进程永远SLEEPING
-    local_intr_save(intr_flag);
-    {
+
         // ========== 步骤2: 设置僵尸状态 ==========
         current->state = PROC_ZOMBIE;    // 变成僵尸进程
         current->exit_code = error_code;  // 保存退出码

@@ -5,7 +5,7 @@
  * 定义 ENABLE_COW 启用写时复制优化
  * 注释掉下面这行则使用传统的完整复制方式
  */
-#define ENABLE_COW 1a
+#define ENABLE_COW 1
 
 /* This file contains the definitions for memory management in our OS. */
 
