@@ -419,11 +419,25 @@ copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf)
  * @clone_flags: used to guide how to clone the child process
  * @stack:       the parent's user stack pointer. if stack==0, It means to fork a kernel thread.
  * @tf:          the trapframe info, which will be copied to child process's proc->tf
+ * 
+ * 【练习3分析 - fork系统调用的内核实现】
+ * 
+ * 执行流程（用户态 -> 内核态 -> 用户态）：
+ * 用户态: fork() -> sys_fork() -> ecall指令 ->
+ * 内核态: trap -> syscall() -> sys_fork() -> do_fork() ->
+ *         [创建子进程] -> wakeup_proc() -> 返回 ->
+ * 用户态: 父进程返回子进程PID，子进程返回0
+ * 
+ * 【COW集成点】
+ * 当clone_flags不含CLONE_VM时，copy_mm会调用dup_mmap->copy_range
+ * copy_range中实现了COW机制，不实际复制页面，而是共享并标记COW
  */
 int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
 {
     int ret = -E_NO_FREE_PROC;
     struct proc_struct *proc;
+    
+    // 检查进程数量是否达到上限
     if (nr_process >= MAX_PROCESS)
     {
         goto fork_out;
@@ -463,32 +477,46 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
      *    update step 1: set child proc's parent to current process, make sure current process's wait_state is 0
      *    update step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
      */
+
+    // ========== 步骤1: 分配并初始化进程控制块 ==========
     if ((proc = alloc_proc()) == NULL) {
         goto fork_out;
     }
+    // 设置父子关系（LAB5更新）
     proc->parent = current;
-    assert(current->wait_state == 0);
+    assert(current->wait_state == 0);  // 确保父进程不在等待状态
 
+    // ========== 步骤2: 分配内核栈 ==========
     if (setup_kstack(proc) != 0) {
         goto bad_fork_cleanup_proc;
     }
 
+    // ========== 步骤3: 复制/共享内存空间 ==========
+    // 【重要】这里调用copy_mm，最终会调用copy_range实现COW
     if (copy_mm(clone_flags, proc) != 0) {
         goto bad_fork_cleanup_kstack;
     }
 
+    // ========== 步骤4: 复制线程上下文 ==========
+    // 设置子进程的trapframe和context
+    // 子进程的a0寄存器被设为0，这就是fork()返回0的原因
     copy_thread(proc, stack, tf);
 
+    // ========== 步骤5: 加入进程管理结构（LAB5更新：使用set_links） ==========
+    // 需要关中断保护临界区
     bool intr_flag;
     local_intr_save(intr_flag);
     {
-        proc->pid = get_pid();
-        hash_proc(proc);
-        set_links(proc);
+        proc->pid = get_pid();       // 分配唯一PID
+        hash_proc(proc);             // 加入哈希表（用于快速查找）
+        set_links(proc);             // 设置进程关系链接（LAB5新增）
     }
     local_intr_restore(intr_flag);
 
-    wakeup_proc(proc);
+    // ========== 步骤6: 唤醒子进程 ==========
+    wakeup_proc(proc);  // 设置为PROC_RUNNABLE状态
+    
+    // ========== 步骤7: 返回子进程PID给父进程 ==========
     ret = proc->pid;
 
 fork_out:
@@ -505,8 +533,19 @@ bad_fork_cleanup_proc:
 //   1. call exit_mmap & put_pgdir & mm_destroy to free the almost all memory space of process
 //   2. set process' state as PROC_ZOMBIE, then call wakeup_proc(parent) to ask parent reclaim itself.
 //   3. call scheduler to switch to other process
+/* 
+ * 【练习3分析 - exit系统调用的内核实现】
+ * 
+ * 执行流程（用户态 -> 内核态，不返回）：
+ * 用户态: exit(code) -> sys_exit() -> ecall指令 ->
+ * 内核态: trap -> syscall() -> sys_exit() -> do_exit() ->
+ *         [释放资源] -> PROC_ZOMBIE -> schedule() -> 永不返回
+ * 
+ * 注意：此函数永不返回！进程的最终资源回收由父进程的do_wait完成
+ */
 int do_exit(int error_code)
 {
+    // idle和init进程不能退出
     if (current == idleproc)
     {
         panic("idleproc exit.\n");
@@ -515,34 +554,55 @@ int do_exit(int error_code)
     {
         panic("initproc exit.\n");
     }
+    
+    // ========== 步骤1: 释放内存空间 ==========
     struct mm_struct *mm = current->mm;
     if (mm != NULL)
     {
+        // 切换到内核页表（避免释放正在使用的页表）
         lsatp(boot_pgdir_pa);
+        
+        // 减少mm引用计数，如果为0则释放
+        // 【COW相关】exit_mmap会释放所有页面，对于COW页面会减少引用计数
         if (mm_count_dec(mm) == 0)
         {
-            exit_mmap(mm);
-            put_pgdir(mm);
-            mm_destroy(mm);
+            exit_mmap(mm);   // 解除所有映射，释放/减少引用计数
+            put_pgdir(mm);   // 释放页目录
+            mm_destroy(mm);  // 销毁mm结构
         }
         current->mm = NULL;
     }
-    current->state = PROC_ZOMBIE;
-    current->exit_code = error_code;
+    
     bool intr_flag;
     struct proc_struct *proc;
+    
+    // 【关键修复】将设置ZOMBIE状态和唤醒父进程放在同一个临界区内
+    // 避免竞态条件：
+    // 1. 子进程先设置ZOMBIE，但还没唤醒父进程
+    // 2. 父进程do_wait检查时发现不是ZOMBIE（因为还在遍历），然后设置SLEEPING
+    // 3. 子进程检查wait_state时父进程还没设置SLEEPING，所以不唤醒
+    // 4. 结果：子进程变成ZOMBIE，父进程永远SLEEPING
     local_intr_save(intr_flag);
     {
+        // ========== 步骤2: 设置僵尸状态 ==========
+        current->state = PROC_ZOMBIE;    // 变成僵尸进程
+        current->exit_code = error_code;  // 保存退出码
+        
+        // ========== 步骤3: 唤醒父进程 ==========
         proc = current->parent;
         if (proc->wait_state == WT_CHILD)
         {
+            // 父进程正在wait，唤醒它
             wakeup_proc(proc);
         }
+        
+        // ========== 步骤4: 处理子进程（托孤给init） ==========
         while (current->cptr != NULL)
         {
             proc = current->cptr;
             current->cptr = proc->optr;
 
+            // 将子进程的父进程改为init
             proc->yptr = NULL;
             if ((proc->optr = initproc->cptr) != NULL)
             {
@@ -550,6 +610,8 @@ int do_exit(int error_code)
             }
             proc->parent = initproc;
             initproc->cptr = proc;
+            
+            // 如果子进程已经是僵尸，唤醒init去回收
             if (proc->state == PROC_ZOMBIE)
             {
                 if (initproc->wait_state == WT_CHILD)
@@ -560,7 +622,11 @@ int do_exit(int error_code)
         }
     }
     local_intr_restore(intr_flag);
+    
+    // ========== 步骤5: 调度到其他进程 ==========
     schedule();
+    
+    // 此函数永不返回！
     panic("do_exit will not return!! %d.\n", current->pid);
 }
 
@@ -743,11 +809,32 @@ bad_mm:
     goto out;
 }
 
-// do_execve - call exit_mmap(mm)&put_pgdir(mm) to reclaim memory space of current process
-//           - call load_icode to setup new memory space accroding binary prog.
+/* do_execve - 执行新程序，替换当前进程的内存空间
+ * 
+ * 【练习3分析 - exec系统调用的内核实现】
+ * 
+ * 执行流程（用户态 -> 内核态 -> 用户态新程序）：
+ * 用户态: exec() -> sys_exec() -> ecall指令 ->
+ * 内核态: trap -> syscall() -> sys_exec() -> do_execve() ->
+ *         [释放旧内存空间] -> load_icode() [加载新程序] ->
+ *         [设置trapframe] -> sret ->
+ * 用户态: 从新程序的入口点开始执行（不返回原程序！）
+ * 
+ * @name:   新程序的名称
+ * @len:    名称长度
+ * @binary: ELF格式程序在内存中的地址
+ * @size:   程序大小
+ * 
+ * 返回值: 成功不返回（开始执行新程序），失败返回负错误码
+ * 
+ * 注意：exec不创建新进程！它复用当前进程的PID、父子关系等，
+ *       只是替换内存空间和执行代码。这就是"fork+exec"模式的意义。
+ */
 int do_execve(const char *name, size_t len, unsigned char *binary, size_t size)
 {
     struct mm_struct *mm = current->mm;
+    
+    // 验证用户传入的程序名指针有效性
     if (!user_mem_check(mm, (uintptr_t)name, len, 0))
     {
         return -E_INVAL;
@@ -757,28 +844,39 @@ int do_execve(const char *name, size_t len, unsigned char *binary, size_t size)
         len = PROC_NAME_LEN;
     }
 
+    // 复制程序名到内核空间（因为马上要释放用户空间）
     char local_name[PROC_NAME_LEN + 1];
     memset(local_name, 0, sizeof(local_name));
     memcpy(local_name, name, len);
 
+    // ========== 步骤1: 释放当前进程的内存空间 ==========
     if (mm != NULL)
     {
         cputs("mm != NULL");
-        lsatp(boot_pgdir_pa);
+        lsatp(boot_pgdir_pa);  // 切换到内核页表
+        
+        // 减少引用计数，必要时释放内存
+        // 【COW相关】如果有共享页面，只减少引用计数
         if (mm_count_dec(mm) == 0)
         {
-            exit_mmap(mm);
-            put_pgdir(mm);
-            mm_destroy(mm);
+            exit_mmap(mm);    // 解除映射
+            put_pgdir(mm);    // 释放页目录
+            mm_destroy(mm);   // 销毁mm结构
         }
         current->mm = NULL;
     }
+    
+    // ========== 步骤2: 加载新程序 ==========
     int ret;
     if ((ret = load_icode(binary, size)) != 0)
     {
         goto execve_exit;
     }
+    
+    // ========== 步骤3: 设置进程名 ==========
     set_proc_name(current, local_name);
+    
+    // 返回0，之后通过trapframe中设置的epc跳转到新程序入口
     return 0;
 
 execve_exit:
@@ -796,9 +894,22 @@ int do_yield(void)
 // do_wait - wait one OR any children with PROC_ZOMBIE state, and free memory space of kernel stack
 //         - proc struct of this child.
 // NOTE: only after do_wait function, all resources of the child proces are free.
+/* 
+ * 【练习3分析 - wait系统调用的内核实现】
+ * 
+ * 执行流程（用户态 -> 内核态 -> 用户态）：
+ * 用户态: wait()/waitpid() -> sys_wait() -> ecall指令 ->
+ * 内核态: trap -> syscall() -> sys_wait() -> do_wait() ->
+ *         [查找ZOMBIE子进程] -> [如无则睡眠] -> [回收资源] -> 返回 ->
+ * 用户态: 返回子进程PID和退出码
+ * 
+ * 注意：只有在do_wait完成后，子进程的所有资源才被完全释放！
+ */
 int do_wait(int pid, int *code_store)
 {
     struct mm_struct *mm = current->mm;
+    
+    // 验证用户空间指针的有效性
     if (code_store != NULL)
     {
         if (!user_mem_check(mm, (uintptr_t)code_store, sizeof(int), 1))
@@ -809,62 +920,92 @@ int do_wait(int pid, int *code_store)
 
     struct proc_struct *proc;
     bool intr_flag, haskid;
-repeat:
+    
+repeat:  // 循环等待，直到找到ZOMBIE子进程
     haskid = 0;
-    if (pid != 0)
+    
+    // 【关键修复】使用中断保护确保检查子进程状态和设置睡眠态是原子的
+    // 避免竞态条件：子进程在检查完后、设置睡眠态前退出，导致父进程永远不被唤醒
+    local_intr_save(intr_flag);
     {
-        proc = find_proc(pid);
-        if (proc != NULL && proc->parent == current)
+        if (pid != 0)
         {
-            haskid = 1;
-            if (proc->state == PROC_ZOMBIE)
+            // ========== 情况1: 等待指定PID的子进程 ==========
+            proc = find_proc(pid);
+            if (proc != NULL && proc->parent == current)
             {
-                goto found;
+                haskid = 1;  // 确认有这个子进程
+                if (proc->state == PROC_ZOMBIE)
+                {
+                    local_intr_restore(intr_flag);
+                    goto found;  // 子进程已退出，去回收
+                }
             }
         }
-    }
-    else
-    {
-        proc = current->cptr;
-        for (; proc != NULL; proc = proc->optr)
+        else
         {
-            haskid = 1;
-            if (proc->state == PROC_ZOMBIE)
+            // ========== 情况2: 等待任意子进程 ==========
+            proc = current->cptr;  // 遍历所有子进程
+            for (; proc != NULL; proc = proc->optr)
             {
-                goto found;
+                haskid = 1;
+                if (proc->state == PROC_ZOMBIE)
+                {
+                    local_intr_restore(intr_flag);
+                    goto found;  // 找到已退出的子进程
+                }
             }
         }
+        
+        // ========== 没有ZOMBIE子进程，进入睡眠等待 ==========
+        if (haskid)
+        {
+            // 设置状态为SLEEPING，等待子进程退出唤醒
+            // 在中断关闭状态下设置，确保不会错过子进程的唤醒
+            current->state = PROC_SLEEPING;
+            current->wait_state = WT_CHILD;
+        }
     }
+    local_intr_restore(intr_flag);
+    
     if (haskid)
     {
-        current->state = PROC_SLEEPING;
-        current->wait_state = WT_CHILD;
-        schedule();
+        schedule();  // 让出CPU
+        
+        // 被唤醒后检查是否需要退出
         if (current->flags & PF_EXITING)
         {
             do_exit(-E_KILLED);
         }
-        goto repeat;
+        goto repeat;  // 重新检查
     }
-    return -E_BAD_PROC;
+    return -E_BAD_PROC;  // 没有子进程
 
 found:
+    // ========== 回收子进程资源 ==========
     if (proc == idleproc || proc == initproc)
     {
         panic("wait idleproc or initproc.\n");
     }
+    
+    // 获取子进程的退出码
     if (code_store != NULL)
     {
         *code_store = proc->exit_code;
     }
+    
+    // 从进程管理结构中移除
     local_intr_save(intr_flag);
     {
-        unhash_proc(proc);
-        remove_links(proc);
+        unhash_proc(proc);    // 从哈希表移除
+        remove_links(proc);   // 从进程树移除
     }
     local_intr_restore(intr_flag);
-    put_kstack(proc);
-    kfree(proc);
+    
+    // 释放最后的资源：内核栈和进程控制块
+    put_kstack(proc);  // 释放内核栈
+    kfree(proc);       // 释放proc结构
+    
     return 0;
 }
 

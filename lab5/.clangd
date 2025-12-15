@@ -1,0 +1,8 @@
+CompileFlags:
+  Add:
+    - "--target=riscv64"
+    - "-D__riscv_xlen=64"
+    - "-include"
+    - "libs/defs.h"
+  Remove:
+    - "-mcmodel=medany"
