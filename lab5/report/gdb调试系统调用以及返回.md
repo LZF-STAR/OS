@@ -31,15 +31,6 @@
 make debug
 ```
 
-![alt text](image.png)
-
-QEMU启动后会停在`Breakpoint`处，等待GDB连接。关键输出：
-```
-kernel_execve: pid = 2, name = "exit".
-Breakpoint
-```
-说明内核已成功启动用户程序并等待调试。
-
 #### 2. 附加到QEMU进程
 
 在**终端2**中：
@@ -86,7 +77,9 @@ Breakpoint 1 at 0x8000f8: file user/libs/syscall.c, line 19.
 (gdb) c
 ```
 
-![alt text](image-2.png)
+![alt text](image.png)
+
+![alt text](image-15.png)
 
 程序停在`syscall`函数处：
 ```
@@ -125,7 +118,7 @@ Breakpoint 1, syscall (num=num@entry=30)
 pc  0x800104
 ```
 
-![alt text](image-3.png)
+![alt text](image-16.png)
 
 此时，CPU即将执行`ecall`指令，这将触发一个异常，从用户态陷入内核态。
 
@@ -189,30 +182,7 @@ Thread 2 "qemu-system-ris" hit Breakpoint 1, riscv_cpu_do_interrupt (
 > 
 > **大模型回答**："使用GDB的`watch`功能可以监控变量变化。当`env->sepc`被写入时，watch会自动中断程序，显示旧值和新值。"
 
-在**终端2**执行：
-```gdb
-# 单步执行几步
-(gdb) n
-(gdb) n
 
-# 监控sepc寄存器（保存返回地址）
-(gdb) watch env->sepc
-Hardware watchpoint 2: env->sepc
-
-(gdb) continue
-```
-
-触发watchpoint：
-```
-Thread 2 hit Hardware watchpoint 2: env->sepc
-Old value = 8388640      (0x800020 - 旧值)
-New value = 8388868      (0x800104 - ecall地址！)
-riscv_cpu_do_interrupt (...) line 563
-563     env->sbadaddr = tval;
-```
-
-![alt text](image-6.png)
-![alt text](image-7.png)
 **查看异常处理的关键信息**：
 ```gdb
 (gdb) p/x env->scause
@@ -241,12 +211,10 @@ Old value = 8388868              (0x800104)
 New value = 18446744072637910736 (0xffffffffc0200ed0 - __alltraps!)
 ```
 
-![alt text](image-8.png)
-
 PC从用户态地址`0x800104`跳转到内核虚拟地址`0xffffffffc0200ed0`（`__alltraps`入口）。
 
 **验证特权级提升**：
-![alt text](image-9.png)
+![alt text](image-18.png)
 ```gdb
 (gdb) n
 (gdb) p env->priv
