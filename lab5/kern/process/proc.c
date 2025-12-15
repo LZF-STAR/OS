@@ -118,13 +118,62 @@ alloc_proc(void)
         memset(&(proc->context), 0, sizeof(struct context));
         memset(proc->name, 0, PROC_NAME_LEN);
 
+        /*
+         * ========== LAB5 更新：进程家族关系字段初始化 ==========
+         * 
+         * 【背景】LAB5引入了用户进程支持，需要维护进程间的父子/兄弟关系
+         * 这些关系用于：
+         *   1. wait系统调用 - 父进程等待子进程退出
+         *   2. exit系统调用 - 子进程退出时通知父进程  
+         *   3. 进程资源回收 - 只有父进程才能回收子进程资源
+         *
+         * 【字段说明】
+         *   wait_state: 进程等待状态标志
+         *     - 0: 进程不在等待任何事件
+         *     - WT_CHILD (0x00000001): 父进程正在wait()等待子进程退出
+         *     - 配合do_wait/do_exit使用，实现父子进程同步
+         *
+         *   cptr (children pointer): 子进程指针
+         *     - 指向该进程的"最新创建的子进程"
+         *     - 类似于子进程链表的头指针
+         *
+         *   yptr (younger sibling pointer): 弟弟指针  
+         *     - 指向比自己晚创建的兄弟进程
+         *
+         *   optr (older sibling pointer): 哥哥指针
+         *     - 指向比自己早创建的兄弟进程
+         *
+         * 【进程家族链表结构示意】
+         *           parent
+         *             | cptr
+         *             v
+         *          child3 ---optr---> child2 ---optr---> child1 --> NULL
+         *          (最新)   <---yptr--- (较早) <---yptr--- (最早)
+         *          NULL<-yptr
+         *
+         * 【初始化原因】
+         *   - wait_state = 0: 新进程不在等待任何事件
+         *   - cptr = NULL: 新进程还没有子进程
+         *   - optr = NULL: 新进程还没有设置兄弟关系(在set_links中设置)
+         *   - yptr = NULL: 新进程是最新创建的，暂时没有弟弟
+         */
         // LAB5 2311456 : (update LAB4 steps)
         /*
          * below fields(add in LAB5) in proc_struct need to be initialized
          *       uint32_t wait_state;                        // waiting state
          *       struct proc_struct *cptr, *yptr, *optr;     // relations between processes
          */
+        // 【LAB5新增】初始化进程等待状态
+        // wait_state = 0 表示进程当前不在等待任何事件
+        // 当父进程调用wait()时，wait_state会被设置为WT_CHILD(=1)
+        // do_exit()会检查parent->wait_state，若为WT_CHILD则唤醒父进程
         proc->wait_state = 0;
+        // 【LAB5新增】初始化进程家族关系指针
+        // cptr (children pointer): 指向第一个子进程（最新创建的）
+        // optr (older sibling pointer): 指向哥哥（比自己早创建的兄弟）
+        // yptr (younger sibling pointer): 指向弟弟（比自己晚创建的兄弟）
+        // 新创建的进程没有子进程和兄弟，所以都初始化为NULL
+        // 真正的兄弟关系会在do_fork的set_links()中建立
         proc->cptr = proc->optr = proc->yptr = NULL;
     }
     return proc;
@@ -469,6 +518,39 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     //    6. call wakeup_proc to make the new child process RUNNABLE
     //    7. set ret vaule using child proc's pid
 
+    /*
+     * ========== LAB5 更新说明：进程家族关系的建立 ==========
+     *
+     * 【LAB4 vs LAB5 的区别】
+     * LAB4: 只有内核线程，没有父子关系的完整管理
+     * LAB5: 引入用户进程，需要完整的进程家族关系管理
+     *
+     * 【步骤1 更新内容】设置父子关系
+     *   - proc->parent = current: 新进程的父进程是当前正在执行的进程
+     *   - assert(current->wait_state == 0): 一致性检查
+     *     * 正在执行fork的进程不可能同时在wait中睡眠
+     *     * 如果wait_state != 0，说明状态机出错
+     *
+     * 【步骤5 更新内容】使用set_links代替直接操作
+     *   - LAB4: 直接 list_add 和 nr_process++
+     *   - LAB5: 调用 set_links(proc) 函数，它会：
+     *     1. list_add(&proc_list, &(proc->list_link)) - 加入进程链表
+     *     2. 设置 optr/yptr 兄弟关系
+     *     3. 更新 parent->cptr 指向新子进程
+     *     4. nr_process++
+     *
+     * 【set_links 详解】
+     *   proc->yptr = NULL;                     // 新进程是最年轻的，没有弟弟
+     *   proc->optr = proc->parent->cptr;       // 原来的大儿子变成自己的哥哥
+     *   if (proc->optr != NULL)
+     *       proc->optr->yptr = proc;           // 哥哥的弟弟指向自己
+     *   proc->parent->cptr = proc;             // 自己成为父进程的新大儿子
+     *
+     * 【为什么需要进程家族关系？】
+     *   1. wait(): 父进程需要遍历所有子进程找ZOMBIE
+     *   2. exit(): 子进程需要通知父进程，并把自己的子进程托孤给init
+     *   3. kill(): 需要确保只能kill自己的子进程
+     */
     // LAB5  : 2310764(update LAB4 steps)
     // TIPS: you should modify your written code in lab4(step1 and step5), not add more code.
     /* Some Functions
@@ -483,8 +565,19 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
         goto fork_out;
     }
     // 设置父子关系（LAB5更新）
+    // 【LAB5步骤1更新】建立父子关系
+    // proc->parent = current 的含义：
+    //   - proc 是新创建的子进程
+    //   - current 是当前正在执行fork的进程（即父进程）
+    //   - 这一行建立了"谁是谁的父亲"的关系
+    //   - fork返回后，子进程可以通过getppid()获取父进程PID
     proc->parent = current;
-    assert(current->wait_state == 0);  // 确保父进程不在等待状态
+    assert(current->wait_state == 0);  
+    // 【一致性断言检查】
+    // current->wait_state == 0 的含义：
+    //   - wait_state != 0 表示进程正在等待某个事件（如等子进程退出）
+    //   - 如果父进程正在wait()中睡眠，它不可能同时执行fork()
+    //   - 这是一个逻辑一致性检查，如果失败说明内核有bug
 
     // ========== 步骤2: 分配内核栈 ==========
     if (setup_kstack(proc) != 0) {
@@ -507,9 +600,22 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
     bool intr_flag;
     local_intr_save(intr_flag);
     {
-        proc->pid = get_pid();       // 分配唯一PID
-        hash_proc(proc);             // 加入哈希表（用于快速查找）
-        set_links(proc);             // 设置进程关系链接（LAB5新增）
+        // 【分配进程ID】调用get_pid()获取一个唯一的PID
+        // get_pid()会遍历proc_list，找到一个未被使用的PID值
+        // PID范围: 1 ~ MAX_PID-1, 避开0(idle)和已使用的值
+        proc->pid = get_pid();
+        // 【加入PID哈希表】用于通过PID快速查找进程
+        // hash_proc(): 根据PID计算哈希值，加入hash_list
+        // 之后可以通过find_proc(pid)在O(1)时间内找到进程
+        hash_proc(proc);
+        // 【LAB5新增：建立进程家族关系】
+        // set_links(proc)做了4件事：
+        //   1. list_add(&proc_list, &proc->list_link) - 加入全局进程链表
+        //   2. proc->optr = proc->parent->cptr - 原来的大儿子变成自己的哥哥
+        //   3. if(proc->optr) proc->optr->yptr = proc - 让哥哥知道自己是他弟弟
+        //   4. proc->parent->cptr = proc - 自己成为父进程的新"大儿子"
+        //   5. nr_process++ - 全局进程计数加1
+        set_links(proc);
     }
     local_intr_restore(intr_flag);
 
@@ -784,6 +890,49 @@ load_icode(unsigned char *binary, size_t size)
     // Keep sstatus
     uintptr_t sstatus = tf->status;
     memset(tf, 0, sizeof(struct trapframe));
+    /*
+     * ========== LAB5 练习1：设置用户态返回的trapframe ==========
+     *
+     * 【目标】使内核能够"返回"到用户态执行新加载的程序
+     *
+     * 【RISC-V 特权级切换机制】
+     * 当执行 sret 指令时：
+     *   1. PC <- sepc  (跳转到sepc保存的地址)
+     *   2. 特权级 <- SPP位 (0=U-mode用户态, 1=S-mode内核态)
+     *   3. SIE <- SPIE (恢复中断使能状态)
+     *   4. SPIE <- 1, SPP <- 0
+     *
+     * 【需要设置的字段】
+     *
+     *   tf->gpr.sp = USTACKTOP:
+     *     - 设置用户栈指针为用户栈顶
+     *     - USTACKTOP 定义在 memlayout.h，是用户栈的最高地址
+     *     - 用户程序从这里开始向下使用栈空间
+     *
+     *   tf->epc = elf->e_entry:
+     *     - 设置程序入口点地址
+     *     - elf->e_entry 是ELF文件头中指定的入口地址(如_start)
+     *     - sret后CPU会跳转到这个地址开始执行用户程序
+     *
+     *   tf->status = sstatus & ~SSTATUS_SPP:
+     *     - 清除SPP位(设为0)
+     *     - SPP=0 表示sret后返回到用户态(U-mode)
+     *     - 如果SPP=1，sret后仍在内核态(S-mode)
+     *
+     *   tf->status |= SSTATUS_SPIE:
+     *     - 设置SPIE位(设为1)
+     *     - sret执行时，SPIE会复制到SIE
+     *     - 这确保返回用户态后中断是开启的
+     *     - 用户程序需要时钟中断来实现进程调度
+     *
+     * 【执行流程】
+     *   load_icode设置好trapframe后:
+     *     -> forkret() 
+     *     -> forkrets() 调用 sret
+     *     -> CPU跳转到tf->epc(用户程序入口)
+     *     -> 特权级切换到用户态
+     *     -> 用户程序开始执行
+     */
     /* LAB5:EXERCISE1 2311456
      * should set tf->gpr.sp, tf->epc, tf->status
      * NOTICE: If we set trapframe correctly, then the user level process can return to USER MODE from kernel. So
@@ -792,9 +941,27 @@ load_icode(unsigned char *binary, size_t size)
      *          tf->status should be appropriate for user program (the value of sstatus)
      *          hint: check meaning of SPP, SPIE in SSTATUS, use them by SSTATUS_SPP, SSTATUS_SPIE(defined in risv.h)
      */
+    // 【设置用户栈指针 sp】
+    // USTACKTOP 是用户栈的最高地址（定义在memlayout.h）
+    // 栈向下生长，所以从USTACKTOP开始向低地址使用
+    // sret返回用户态后，sp寄存器会被设为这个值
     tf->gpr.sp = USTACKTOP;
+    // 【设置程序入口点 epc】
+    // elf->e_entry 是ELF文件头中指定的程序入口地址
+    // 通常指向 _start 函数，然后调用 main()
+    // sret指令执行时：PC <- sepc，即跳转到这个地址
     tf->epc = elf->e_entry;
+    // 【设置特权级：清除SPP位，返回用户态】
+    // SSTATUS_SPP 是 sstatus 寄存器中的 SPP 位(bit 8)
+    // SPP = 0: sret后进入用户态(U-mode)
+    // SPP = 1: sret后仍在内核态(S-mode)
+    // ~SSTATUS_SPP 是取反，& 操作将SPP位清0
     tf->status = sstatus & ~SSTATUS_SPP;
+    // 【设置中断使能：设置SPIE位，返回后开中断】
+    // SSTATUS_SPIE 是 sstatus 寄存器中的 SPIE 位(bit 5)
+    // sret执行时：SIE <- SPIE（即中断使能位被设为SPIE的值）
+    // SPIE = 1 意味着返回用户态后，中断是开启的
+    // 这很重要！用户程序需要时钟中断来实现进程调度
     tf->status |= SSTATUS_SPIE;
 
     ret = 0;
