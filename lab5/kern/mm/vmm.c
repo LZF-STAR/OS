@@ -454,7 +454,15 @@ int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
     local_intr_restore(intr_flag);
     return 0;
 }
+#else /* !ENABLE_COW */
+/* Non-COW version: always return error (page faults are fatal) */
+int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
+{
+    return -1;  /* Cannot handle page fault without COW */
+}
 #endif /* ENABLE_COW */
+
+
 
 bool user_mem_check(struct mm_struct *mm, uintptr_t addr, size_t len, bool write)
 {
