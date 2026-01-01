@@ -152,8 +152,8 @@ alloc_proc(void)
         proc->lab6_run_pool.left = proc->lab6_run_pool.right = proc->lab6_run_pool.parent = NULL;
         proc->lab6_stride = 0;
         proc->lab6_priority = 0;
-
-        
+        // lab8 add:
+        proc->filesp = NULL;
     }
     return proc;
 }
@@ -273,6 +273,16 @@ void proc_run(struct proc_struct *proc)
        *       flush_tlb():          flush the tlb        
        */
     
+    if (proc != current)
+    {
+        bool intr_flag;
+        struct proc_struct *prev = current, *next = proc;
+        local_intr_save(intr_flag);
+        current = proc;
+        lsatp(next->pgdir);
+        switch_to(&(prev->context), &(next->context));
+        local_intr_restore(intr_flag);
+    }
 }
 
 // forkret -- the first kernel entry point of a new thread/process
@@ -538,11 +548,46 @@ int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
      *    update step 1: set child proc's parent to current process, make sure current process's wait_state is 0
      *    update step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
      */
-    
-    if (copy_files(clone_flags, proc) != 0)
-    { // for LAB8
+    // Step 1: call alloc_proc to allocate a proc_struct
+    if ((proc = alloc_proc()) == NULL) {
+        goto fork_out;
+    }
+    proc->parent = current;
+    assert(current->wait_state == 0);
+
+    // Step 2: call setup_kstack to allocate a kernel stack for child process
+    if (setup_kstack(proc) != 0) {
+        goto bad_fork_cleanup_proc;
+    }
+
+    // Step 3: call copy_mm to dup OR share mm according clone_flag
+    if (copy_mm(clone_flags, proc) != 0) {
         goto bad_fork_cleanup_kstack;
     }
+
+    // Step 3.5 (LAB8): copy files
+    if (copy_files(clone_flags, proc) != 0) {
+        goto bad_fork_cleanup_kstack;
+    }
+
+    // Step 4: call copy_thread to setup tf & context in proc_struct
+    copy_thread(proc, stack, tf);
+
+    // Step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        proc->pid = get_pid();
+        hash_proc(proc);
+        set_links(proc);
+    }
+    local_intr_restore(intr_flag);
+
+    // Step 6: call wakeup_proc to make the new child process RUNNABLE
+    wakeup_proc(proc);
+
+    // Step 7: set ret value using child proc's pid
+    ret = proc->pid;
     
 fork_out:
     return ret;
