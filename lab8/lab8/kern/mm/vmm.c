@@ -53,7 +53,7 @@ mm_create(void)
         mm->sm_priv = NULL;
 
         set_mm_count(mm, 0);
-        lock_init(&(mm->mm_lock));
+        sem_init(&(mm->mm_sem), 1);
     }
     return mm;
 }
@@ -349,121 +349,6 @@ check_vma_struct(void)
 
     cprintf("check_vma_struct() succeeded!\n");
 }
-
-#ifdef ENABLE_COW
-/* do_pgfault - Page Fault Handler for COW (Copy-on-Write)
- *
- * When a process tries to write to a COW page, CPU triggers Store Page Fault.
- * This function handles the COW page copy.
- *
- * @mm:         Memory management struct of current process
- * @error_code: Error code (provided by CPU, identifies error type)
- * @addr:       Virtual address that triggered page fault (stored in stval)
- *
- * COW handling flow:
- * 1. Check if address is in valid VMA range
- * 2. Get PTE and check for PTE_COW flag
- * 3. Based on page reference count:
- *    - page_ref > 1: Multiple processes share this page, need to copy
- *    - page_ref == 1: Only current process uses it, just modify permission
- *
- * Return: 0 on success, negative on error
- */
-int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
-{
-    // Check if mm is valid
-    if (mm == NULL)
-    {
-        return -E_INVAL;
-    }
-
-    // Align address to page boundary
-    uintptr_t la = ROUNDDOWN(addr, PGSIZE);
-    
-    // Find VMA containing this address
-    struct vma_struct *vma = find_vma(mm, la);
-    if (vma == NULL || vma->vm_start > la)
-    {
-        // Address not in any valid VMA range
-        return -E_INVAL;
-    }
-
-    // Get page table entry (don't create new page table)
-    pte_t *ptep = get_pte(mm->pgdir, la, 0);
-    if (ptep == NULL || !(*ptep & PTE_V))
-    {
-        // PTE does not exist or invalid, this is not COW case
-        // Note: Full implementation should handle demand paging here
-        return -E_INVAL;
-    }
-
-    // [COW Detection] Check if this is a COW page
-    if ((*ptep & PTE_COW) == 0)
-    {
-        // Not a COW page, should not be handled by this function
-        return -E_INVAL;
-    }
-
-    // [Critical Fix] Disable interrupts to protect entire COW handling
-    // Prevent process switch between checking page_ref and modifying PTE
-    bool intr_flag;
-    local_intr_save(intr_flag);
-
-    // Get current permission and physical page
-    uint32_t perm = *ptep & PTE_USER;
-    struct Page *page = pte2page(*ptep);
-    int ref = page_ref(page);
-
-    // [COW Core Handling] Based on reference count
-    if (ref > 1)
-    {
-        // Case 1: Multiple processes share this page
-        // Need to allocate new page and copy content
-        
-        // Allocate a new physical page
-        struct Page *npage = alloc_page();
-        if (npage == NULL)
-        {
-            local_intr_restore(intr_flag);
-            return -E_NO_MEM;
-        }
-        
-        // Copy original page content to new page
-        memcpy(page2kva(npage), page2kva(page), PGSIZE);
-        
-        // Set new permission: restore write permission, clear COW flag
-        perm = (perm | PTE_W | PTE_R) & ~PTE_COW;
-        
-        // Use page_insert to map new page to current process
-        // page_insert will automatically decrease old page's ref count
-        page_insert(mm->pgdir, npage, la, perm);
-    }
-    else
-    {
-        // Case 2: Only current process references this page (page_ref == 1)
-        // No need to copy, just modify permission (optimization: save copy overhead)
-        
-        // Restore write permission, clear COW flag
-        perm = (perm | PTE_W | PTE_R) & ~PTE_COW;
-        *ptep = (*ptep & ~PTE_COW) | PTE_W | PTE_R;
-        
-        // Flush TLB to make permission change effective
-        tlb_invalidate(mm->pgdir, la);
-    }
-
-    local_intr_restore(intr_flag);
-    return 0;
-}
-#else /* !ENABLE_COW */
-/* Non-COW version: always return error (page faults are fatal) */
-int do_pgfault(struct mm_struct *mm, uint32_t error_code, uintptr_t addr)
-{
-    return -1;  /* Cannot handle page fault without COW */
-}
-#endif /* ENABLE_COW */
-
-
-
 bool user_mem_check(struct mm_struct *mm, uintptr_t addr, size_t len, bool write)
 {
     if (mm != NULL)
@@ -496,4 +381,33 @@ bool user_mem_check(struct mm_struct *mm, uintptr_t addr, size_t len, bool write
         return 1;
     }
     return KERN_ACCESS(addr, addr + len);
+}
+bool copy_string(struct mm_struct *mm, char *dst, const char *src,
+                 size_t maxn)
+{
+    size_t alen,
+        part = ROUNDDOWN((uintptr_t)src + PGSIZE, PGSIZE) - (uintptr_t)src;
+    while (1)
+    {
+        if (part > maxn)
+        {
+            part = maxn;
+        }
+        if (!user_mem_check(mm, (uintptr_t)src, part, 0))
+        {
+            return 0;
+        }
+        if ((alen = strnlen(src, part)) < part)
+        {
+            memcpy(dst, src, alen + 1);
+            return 1;
+        }
+        if (part == maxn)
+        {
+            return 0;
+        }
+        memcpy(dst, src, part);
+        dst += part, src += part, maxn -= part;
+        part = PGSIZE;
+    }
 }
