@@ -695,24 +695,170 @@ load_icode(int fd, int argc, char **kargv)
      *  pgdir_alloc_page - allocate new memory for  TEXT/DATA/BSS/stack parts
      *  lsatp             - update Page Directory Addr Register -- CR3
      */
-    //You can Follow the code form LAB5 which you have completed  to complete 
-    /* (1) create a new mm for current process
-     * (2) create a new PDT, and mm->pgdir= kernel virtual addr of PDT
-     * (3) copy TEXT/DATA/BSS parts in binary to memory space of process
-     *    (3.1) read raw data content in file and resolve elfhdr
-     *    (3.2) read raw data content in file and resolve proghdr based on info in elfhdr
-     *    (3.3) call mm_map to build vma related to TEXT/DATA
-     *    (3.4) callpgdir_alloc_page to allocate page for TEXT/DATA, read contents in file
-     *          and copy them into the new allocated pages
-     *    (3.5) callpgdir_alloc_page to allocate pages for BSS, memset zero in these pages
-     * (4) call mm_map to setup user stack, and put parameters into user stack
-     * (5) setup current process's mm, cr3, reset pgidr (using lsatp MARCO)
-     * (6) setup uargc and uargv in user stacks
-     * (7) setup trapframe for user environment
-     * (8) if up steps failed, you should cleanup the env.
-     */
+
+    assert(argc >= 0 && argc <= EXEC_MAX_ARG_NUM);
+    int ret = -E_NO_MEM;
+
+    // (1) create a new mm for current process
+    struct mm_struct *mm;
+    if ((mm = mm_create()) == NULL) {
+        goto bad_mm;
+    }
+
+    // (2) create a new PDT, and mm->pgdir= kernel virtual addr of PDT
+    if (setup_pgdir(mm) != 0) {
+        goto bad_pgdir_cleanup_mm;
+    }
+
+    // (3) copy TEXT/DATA/BSS parts in binary to memory space of process
+    struct Page *page;
     
+    // (3.1) read raw data content in file and resolve elfhdr
+    struct elfhdr __elf, *elf = &__elf;
+    if ((ret = load_icode_read(fd, elf, sizeof(struct elfhdr), 0)) != 0) {
+        goto bad_elf_cleanup_pgdir;
+    }
+
+    if (elf->e_magic != ELF_MAGIC) {
+        ret = -E_INVAL_ELF;
+        goto bad_elf_cleanup_pgdir;
+    }
+
+    // (3.2) read raw data content in file and resolve proghdr based on info in elfhdr
+    struct proghdr __ph, *ph = &__ph;
+    uint32_t vm_flags, perm, phnum;
+    for (phnum = 0; phnum < elf->e_phnum; phnum++) {
+        off_t phoff = elf->e_phoff + sizeof(struct proghdr) * phnum;
+        if ((ret = load_icode_read(fd, ph, sizeof(struct proghdr), phoff)) != 0) {
+            goto bad_cleanup_mmap;
+        }
+        if (ph->p_type != ELF_PT_LOAD) {
+            continue;
+        }
+        if (ph->p_filesz > ph->p_memsz) {
+            ret = -E_INVAL_ELF;
+            goto bad_cleanup_mmap;
+        }
+        if (ph->p_filesz == 0) {
+            // continue;
+        }
+
+        // (3.3) call mm_map to build vma related to TEXT/DATA
+        vm_flags = 0, perm = PTE_U | PTE_V;  // User + Valid
+        if (ph->p_flags & ELF_PF_X) { vm_flags |= VM_EXEC; perm |= PTE_X; }
+        if (ph->p_flags & ELF_PF_W) { vm_flags |= VM_WRITE; perm |= PTE_W; }
+        if (ph->p_flags & ELF_PF_R) { vm_flags |= VM_READ; perm |= PTE_R; }
+
+        if ((ret = mm_map(mm, ph->p_va, ph->p_memsz, vm_flags, NULL)) != 0) {
+            goto bad_cleanup_mmap;
+        }
+
+        // (3.4) call pgdir_alloc_page to allocate page for TEXT/DATA, read contents in file
+        //       and copy them into the new allocated pages
+        off_t offset = ph->p_offset;
+        size_t off, size;
+        uintptr_t start = ph->p_va, end, la = ROUNDDOWN(start, PGSIZE);
+
+        ret = -E_NO_MEM;
+        end = ph->p_va + ph->p_filesz;
+        while (start < end) {
+            if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL) {
+                goto bad_cleanup_mmap;
+            }
+            off = start - la;
+            size = PGSIZE - off;
+            la += PGSIZE;
+            if (end < la) {
+                size -= la - end;
+            }
+            if ((ret = load_icode_read(fd, page2kva(page) + off, size, offset)) != 0) {
+                goto bad_cleanup_mmap;
+            }
+            start += size, offset += size;
+        }
+
+        // (3.5) call pgdir_alloc_page to allocate pages for BSS, memset zero in these pages
+        end = ph->p_va + ph->p_memsz;
+        if (start < la) {
+            if (start == end) {
+                continue;
+            }
+            off = start + PGSIZE - la;
+            size = PGSIZE - off;
+            if (end < la) {
+                size -= la - end;
+            }
+            memset(page2kva(page) + off, 0, size);
+            start += size;
+            assert((end < la && start == end) || (end >= la && start == la));
+        }
+        while (start < end) {
+            if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL) {
+                ret = -E_NO_MEM;
+                goto bad_cleanup_mmap;
+            }
+            off = start - la;
+            size = PGSIZE - off;
+            la += PGSIZE;
+            if (end < la) {
+                size -= la - end;
+            }
+            memset(page2kva(page) + off, 0, size);
+            start += size;
+        }
+    }
+    sysfile_close(fd);
+
+    // (4) call mm_map to setup user stack, and put parameters into user stack
+    vm_flags = VM_READ | VM_WRITE | VM_STACK;
+    if ((ret = mm_map(mm, USTACKTOP - USTACKSIZE, USTACKSIZE, vm_flags, NULL)) != 0) {
+        goto bad_cleanup_mmap;
+    }
+    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - PGSIZE, PTE_USER) != NULL);
+    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - 2 * PGSIZE, PTE_USER) != NULL);
+    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - 3 * PGSIZE, PTE_USER) != NULL);
+    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - 4 * PGSIZE, PTE_USER) != NULL);
+
+    // (5) setup current process's mm, cr3, reset pgidr (using lsatp MARCO)
+    mm_count_inc(mm);
+    current->mm = mm;
+    current->pgdir = PADDR(mm->pgdir);
+    lsatp(current->pgdir);
+
+    // (6) setup uargc and uargv in user stacks
+    uintptr_t stacktop = USTACKTOP - argc * PGSIZE;
+    char **uargv = (char **)(stacktop - argc * sizeof(char *));
+    int i;
+    for (i = 0; i < argc; i++) {
+        uargv[i] = strcpy((char *)(stacktop + i * PGSIZE), kargv[i]);
+    }
+    stacktop = (uintptr_t)uargv - sizeof(int);
+    *(int *)stacktop = argc;
+
+    // (7) setup trapframe for user environment
+    struct trapframe *tf = current->tf;
+    uintptr_t sstatus = tf->status;
+    memset(tf, 0, sizeof(struct trapframe));
+    tf->gpr.sp = stacktop;
+    tf->gpr.a0 = argc;
+    tf->gpr.a1 = (uintptr_t)uargv;
+    tf->epc = elf->e_entry;
+    tf->status = (sstatus & ~SSTATUS_SPP) | SSTATUS_SPIE;
+
+    ret = 0;
+out:
+    return ret;
+
+bad_cleanup_mmap:
+    exit_mmap(mm);
+bad_elf_cleanup_pgdir:
+    put_pgdir(mm);
+bad_pgdir_cleanup_mm:
+    mm_destroy(mm);
+bad_mm:
+    goto out;
 }
+
 
 // this function isn't very correct in LAB8
 static void

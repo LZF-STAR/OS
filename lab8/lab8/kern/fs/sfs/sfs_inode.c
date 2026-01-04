@@ -600,6 +600,51 @@ sfs_io_nolock(struct sfs_fs *sfs, struct sfs_inode *sin, void *buf, off_t offset
 	 *       NOTICE: useful function: sfs_bmap_load_nolock, sfs_buf_op	
 	*/
 
+    // (1) 如果 offset 不是块对齐的，处理首个部分块
+    blkoff = offset % SFS_BLKSIZE;
+    if (blkoff != 0) {
+        size = (nblks != 0) ? (SFS_BLKSIZE - blkoff) : (endpos - offset);
+        if ((ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino)) != 0) {
+            goto out;
+        }
+        if ((ret = sfs_buf_op(sfs, buf, size, ino, blkoff)) != 0) {
+            goto out;
+        }
+        alen += size;
+        buf += size;
+        blkno++;
+        if (nblks > 0) {
+            nblks--;
+        }
+    }
+
+    // (2) 读写中间的完整块
+    while (nblks > 0) {
+        if ((ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino)) != 0) {
+            goto out;
+        }
+        if ((ret = sfs_block_op(sfs, buf, ino, 1)) != 0) {
+            goto out;
+        }
+        alen += SFS_BLKSIZE;
+        buf += SFS_BLKSIZE;
+        blkno++;
+        nblks--;
+    }
+
+    // (3) 如果 endpos 不是块对齐的，处理末尾部分块
+    // 检查 blkno 是否为 endpos 所在块，如果步骤(1)已处理完则 blkno 会超过该块
+    size = endpos % SFS_BLKSIZE;
+    if (size != 0 && blkno == endpos / SFS_BLKSIZE) {
+        if ((ret = sfs_bmap_load_nolock(sfs, sin, blkno, &ino)) != 0) {
+            goto out;
+        }
+        if ((ret = sfs_buf_op(sfs, buf, size, ino, 0)) != 0) {
+            goto out;
+        }
+        alen += size;
+    }
+
     
 
 out:
